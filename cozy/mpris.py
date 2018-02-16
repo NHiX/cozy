@@ -20,8 +20,8 @@ from gi.repository import Gio, Gst, GLib, Gtk
 
 from random import randint
 
-from cozy.player import *
-from cozy.db import *
+import cozy.player as player
+import cozy.db as db
 import cozy.artwork_cache as artwork_cache
 
 
@@ -35,7 +35,7 @@ class Server:
                 method_outargs[method.name] = "(" + "".join(
                               [arg.signature for arg in method.out_args]) + ")"
                 method_inargs[method.name] = tuple(
-                    arg.signature for arg in method.in_args)
+                                       arg.signature for arg in method.in_args)
 
             con.register_object(object_path=path,
                                 interface_info=interface,
@@ -142,6 +142,7 @@ class MPRIS(Server):
             <property name="PlaybackStatus" type="s" access="read"/>
             <property name="Metadata" type="a{sv}" access="read">
             </property>
+            <property name="Volume" type="d" access="readwrite"/>
             <property name="Position" type="x" access="read"/>
             <property name="CanGoNext" type="b" access="read"/>
             <property name="CanGoPrevious" type="b" access="read"/>
@@ -164,8 +165,8 @@ class MPRIS(Server):
         self.__rating = None
         self.__cozy_id = 0
         self.__metadata = {"mpris:trackid": GLib.Variant(
-            "o",
-            "/org/mpris/MediaPlayer2/TrackList/NoTrack")}
+                                  "o",
+                                  "/org/mpris/MediaPlayer2/TrackList/NoTrack")}
         self.__track_id = self.__get_media_id(0)
         self.__bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
         Gio.bus_own_name_on_connection(self.__bus,
@@ -175,13 +176,10 @@ class MPRIS(Server):
                                        None)
         Server.__init__(self, self.__bus, self.__MPRIS_PATH)
 
-        bus = get_gst_bus()
-        bus.connect("message", self.__on_gst_message)
+        player.add_player_listener(self.__on_player_message)
+        self.__on_current_changed()
+        self.__on_status_changed()
 
-        #Lp().player.connect("current-changed", self.__on_current_changed)
-        #Lp().player.connect("seeked", self.__on_seeked)
-        #Lp().player.connect("status-changed", self.__on_status_changed)
-        #Lp().player.connect("volume-changed", self.__on_volume_changed)
 
     def Raise(self):
         self.__app.window.setup_window()
@@ -191,42 +189,48 @@ class MPRIS(Server):
         self.__app.quit()
 
     def Next(self):
-        next_track()
+        player.next_track()
 
     def Previous(self):
-        prev_track()
+        player.rev_track()
 
     def Pause(self):
-        play_pause(None)
+        player.play_pause(None)
 
     def PlayPause(self):
-        play_pause(None)
+        player.play_pause(None)
 
     def Stop(self):
-        stop(None)
+        player.stop()
 
     def Play(self):
-        play_pause(None)
+        player.play_pause(None)
 
     def SetPosition(self, track_id, position):
-        jump_to_ns(position)
+        player.jump_to_ns(position)
+
+    def OpenUri(self, uri):
+        pass
 
     def Seek(self, offset):
-        pass
+        duration = player.get_current_duration()
+        player.jump_to_ns(duration + offset)
 
     def Seeked(self, position):
         self.__bus.emit_signal(
-            None,
-            self.__MPRIS_PATH,
-            self.__MPRIS_PLAYER_IFACE,
-            "Seeked",
-            GLib.Variant.new_tuple(GLib.Variant("x", position)))
+                          None,
+                          self.__MPRIS_PATH,
+                          self.__MPRIS_PLAYER_IFACE,
+                          "Seeked",
+                          GLib.Variant.new_tuple(GLib.Variant("x", position)))
 
     def Get(self, interface, property_name):
         if property_name in ["CanQuit", "CanRaise", "CanSeek",
-                             "CanControl", "HasRatingsExtension"]:
+                             "CanControl"]:
             return GLib.Variant("b", True)
         elif property_name == "HasTrackList":
+            return GLib.Variant("b", False)
+        elif property_name == "Shuffle":
             return GLib.Variant("b", False)
         elif property_name == "Identity":
             return GLib.Variant("s", "Cozy")
@@ -241,15 +245,19 @@ class MPRIS(Server):
                                        "audio/mpeg"])
         elif property_name == "PlaybackStatus":
             return GLib.Variant("s", self.__get_status())
+        elif property_name == "LoopStatus":
+            return GLib.Variant("s", "None")
         elif property_name == "Metadata":
             return GLib.Variant("a{sv}", self.__metadata)
+        elif property_name == "Volume":
+            return GLib.Variant("d", Lp().player.volume)
         elif property_name == "Position":
             return GLib.Variant(
-                "x",
-                get_current_duration())
+                               "x",
+                               player.get_current_duration())
         elif property_name in ["CanGoNext", "CanGoPrevious",
                                "CanPlay", "CanPause"]:
-            return GLib.Variant("b", get_current_track() is not None)
+            return GLib.Variant("b", player.get_current_track() is not None)
 
     def GetAll(self, interface):
         ret = {}
@@ -265,6 +273,7 @@ class MPRIS(Server):
         elif interface == self.__MPRIS_PLAYER_IFACE:
             for property_name in ["PlaybackStatus",
                                   "Metadata",
+                                  "Volume",
                                   "Position",
                                   "CanGoNext",
                                   "CanGoPrevious",
@@ -278,7 +287,7 @@ class MPRIS(Server):
         return ret
 
     def Set(self, interface, property_name, new_value):
-        # if property_name == "Volume":
+        #if property_name == "Volume":
         #    Lp().player.set_volume(new_value)
         pass
 
@@ -307,34 +316,35 @@ class MPRIS(Server):
             it must have a different TrackId.
         """
         track_id = track_id + randint(10000000, 90000000)
-        return GLib.Variant("o", "/de/geigi/Cozy/TrackId/%s" % track_id)
+        return GLib.Variant("o", "/com/geigi/cozy/TrackId/%s" % track_id)
 
     def __get_status(self):
-        state = get_gst_player_state()
+        state = player.get_gst_player_state()
         if state == Gst.State.PLAYING:
             return "Playing"
         elif state == Gst.State.PAUSED:
             return "Paused"
         else:
+            print("stopped")
             return "Stopped"
 
-    def __on_gst_message(self, bus, message):
-        t = message.type
-        if t == Gst.MessageType.STREAM_START:
-            # new track is playing
+    def __on_player_message(self, event, message):
+        print("Test")
+        if event == "stop":
             self.__on_current_changed()
-            pass
-        elif t == Gst.MessageType.STATE_CHANGED:
-            # handle play / pause / skip
+        elif event == "play":
             self.__on_status_changed()
-            pass
+        elif event == "pause":
+            self.__on_status_changed()
+        elif event == "track-changed":
+            self.__on_current_changed()
 
     def __update_metadata(self):
-        track = get_current_track()
+        track = player.get_current_track()
         if self.__get_status() == "Stopped":
             self.__metadata = {"mpris:trackid": GLib.Variant(
-                "o",
-                "/org/mpris/MediaPlayer2/TrackList/NoTrack")}
+                                  "o",
+                                  "/org/mpris/MediaPlayer2/TrackList/NoTrack")}
         else:
             self.__metadata["mpris:trackid"] = self.__track_id
             track_number = track.number
@@ -343,36 +353,50 @@ class MPRIS(Server):
             self.__metadata["xesam:trackNumber"] = GLib.Variant("i",
                                                                 track_number)
             self.__metadata["xesam:title"] = GLib.Variant(
-                "s",
-                track.name)
+                                                "s",
+                                                track.name)
             self.__metadata["xesam:album"] = GLib.Variant(
-                "s",
-                track.book.name)
+                                          "s",
+                                          track.book.name)
             self.__metadata["xesam:artist"] = GLib.Variant(
-                "s",
-                track.book.author)
+                                             "as",
+                                             track.book.author)
+            self.__metadata["xesam:albumArtist"] = GLib.Variant(
+                                       "as",
+                                       track.book.reader)
             self.__metadata["mpris:length"] = GLib.Variant(
-                "x",
-                track.length * 1000 * 1000)
+                              "x",
+                              track.length * 1000 * 1000)
+            self.__metadata["xesam:genre"] = GLib.Variant(
+                                              "as",
+                                              "")
             self.__metadata["xesam:url"] = GLib.Variant(
-                "s",
-                "file:///" + track.file)
+                                                 "s",
+                                                 "file:///" + track.file)
 
             cover_path = "/tmp/cozy_mpris.jpg"
             pixbuf = artwork_cache.get_cover_pixbuf(track.book)
             if pixbuf is not None:
                 pixbuf.savev(cover_path, "jpeg",
-                             ["quality"], ["90"])
+                            ["quality"], ["90"])
+
             if cover_path is not None:
                 self.__metadata["mpris:artUrl"] = GLib.Variant(
-                    "s",
-                    "file://" + cover_path)
+                                                        "s",
+                                                        "file:///" + cover_path)
 
     def __on_seeked(self, player, position):
         self.Seeked(position * (1000 * 1000))
 
+    def __on_volume_changed(self, player, data=None):
+        # self.PropertiesChanged(self.__MPRIS_PLAYER_IFACE,
+                            #    {"Volume": GLib.Variant("d",
+                                # Lp().player.volume), },
+                            #    [])
+        pass
+
     def __on_current_changed(self):
-        current_track_id = get_current_track().id
+        current_track_id = player.get_current_track().id
         if current_track_id and current_track_id >= 0:
             self.__cozy_id = current_track_id
         else:
